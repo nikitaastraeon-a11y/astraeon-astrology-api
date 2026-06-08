@@ -4,4 +4,4 @@ pyswisseph==2.10.3.2
 geopy==2.4.1
 timezonefinder==6.5.2
 pytz==2024.1
-pydantic==2.8.2
+pydantic==2.11.5
