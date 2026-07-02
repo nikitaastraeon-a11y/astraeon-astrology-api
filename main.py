@@ -82,6 +82,7 @@ class BirthData(BaseModel):
     lat: float
     lng: float
     tz_str: str = "AUTO"
+    include_outer_planets: bool = False  # Uranus/Neptune/Pluto as a supplementary (non-graha) layer
 
 class AstroCartographyRequest(BaseModel):
     name: str = ""
@@ -129,8 +130,11 @@ def _navamsa_sign(lon: float) -> tuple[str, int]:
     result_idx   = (NAVAMSA_START[sign_idx] + nav_idx) % 12
     return SIGNS[result_idx], result_idx + 1
 
-def _compute_chart(jd: float, lat: float, lng: float) -> dict:
-    """Core Vedic chart calculation — all planets, ascendant, whole-sign houses."""
+def _compute_chart(jd: float, lat: float, lng: float, include_outer: bool = False) -> dict:
+    """Core Vedic chart calculation — all planets, ascendant, whole-sign houses.
+    Set include_outer to also return Uranus/Neptune/Pluto as a separate, clearly
+    non-graha layer (sidereal sign/house/nakshatra) that never affects dasha,
+    dignity, or aspect logic."""
     swe.set_sid_mode(swe.SIDM_LAHIRI)
     flags       = swe.FLG_MOSEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
     ayanamsha   = swe.get_ayanamsa_ut(jd)
@@ -188,6 +192,28 @@ def _compute_chart(jd: float, lat: float, lng: float) -> dict:
             "is_retrograde":  False,
         })
 
+    # Outer planets — supplementary layer, kept OUT of `planets` so the
+    # traditional Jyotish machinery (dasha, dignity, drishti) is untouched.
+    outer_planets = []
+    if include_outer:
+        for planet_id, name in OUTER_PLANETS:
+            xx, _    = swe.calc_ut(jd, planet_id, flags)
+            lon      = xx[0] % 360
+            speed    = xx[3]
+            sign_idx = int(lon / 30)
+            nak      = _nakshatra(lon)
+            outer_planets.append({
+                "name":           name,
+                "longitude":      round(lon, 4),
+                "sign":           SIGNS[sign_idx],
+                "sign_id":        sign_idx + 1,
+                "degree_in_sign": round(lon % 30, 4),
+                "nakshatra":      nak["name"],
+                "house":          ((sign_idx - asc_sign_idx) % 12) + 1,
+                "is_retrograde":  speed < 0,
+                "is_graha":       False,   # not a classical graha: no dasha/dignity
+            })
+
     # Whole-sign houses
     houses = [
         {"house": i + 1, "sign": SIGNS[(asc_sign_idx + i) % 12], "sign_id": ((asc_sign_idx + i) % 12) + 1}
@@ -205,6 +231,7 @@ def _compute_chart(jd: float, lat: float, lng: float) -> dict:
             "nakshatra_lord": asc_nak["lord"],
         },
         "planets":        planets,
+        "outer_planets":  outer_planets,
         "houses":         houses,
         "moon_longitude": moon_lon,
         "ayanamsha":      round(ayanamsha, 4),
@@ -262,15 +289,29 @@ def _compute_navamsa(chart: dict) -> dict:
             "is_retrograde": p["is_retrograde"],
         })
 
+    # Outer planets navamsa — same supplementary, non-graha treatment.
+    nav_outer = []
+    for p in chart.get("outer_planets", []):
+        sign, sign_id = _navamsa_sign(p["longitude"])
+        nav_outer.append({
+            "name":          p["name"],
+            "sign":          sign,
+            "sign_id":       sign_id,
+            "house":         ((sign_id - 1 - asc_nav_idx) % 12) + 1,
+            "is_retrograde": p["is_retrograde"],
+            "is_graha":      False,
+        })
+
     nav_houses = [
         {"house": i + 1, "sign": SIGNS[(asc_nav_idx + i) % 12], "sign_id": ((asc_nav_idx + i) % 12) + 1}
         for i in range(12)
     ]
 
     return {
-        "ascendant": {"sign": asc_nav_sign, "sign_id": asc_nav_id},
-        "planets":   nav_planets,
-        "houses":    nav_houses,
+        "ascendant":     {"sign": asc_nav_sign, "sign_id": asc_nav_id},
+        "planets":       nav_planets,
+        "outer_planets": nav_outer,
+        "houses":        nav_houses,
     }
 
 # ── Astrocartography ─────────────────────────────────────────────────────────
@@ -669,11 +710,12 @@ def geocode(req: GeocodeRequest):
 
 @app.post("/chart")
 def chart(data: BirthData):
-    """Rasi (D-1) chart — all 9 planets + Ketu, ascendant, whole-sign houses."""
+    """Rasi (D-1) chart — 9 grahas + Ketu, ascendant, whole-sign houses.
+    Set include_outer_planets to also get Uranus/Neptune/Pluto in a separate layer."""
     try:
         tz  = data.tz_str if data.tz_str != "AUTO" else _detect_tz(data.lat, data.lng)
         jd  = _to_jd(data.year, data.month, data.day, data.hour, data.minute, tz)
-        res = _compute_chart(jd, data.lat, data.lng)
+        res = _compute_chart(jd, data.lat, data.lng, data.include_outer_planets)
         res["name"] = data.name
         res["birth"] = {
             "year": data.year, "month": data.month, "day": data.day,
@@ -705,7 +747,7 @@ def navamsa(data: BirthData):
     try:
         tz    = data.tz_str if data.tz_str != "AUTO" else _detect_tz(data.lat, data.lng)
         jd    = _to_jd(data.year, data.month, data.day, data.hour, data.minute, tz)
-        chart = _compute_chart(jd, data.lat, data.lng)
+        chart = _compute_chart(jd, data.lat, data.lng, data.include_outer_planets)
         return _compute_navamsa(chart)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -716,7 +758,7 @@ def kundli(data: BirthData):
     try:
         tz    = data.tz_str if data.tz_str != "AUTO" else _detect_tz(data.lat, data.lng)
         jd    = _to_jd(data.year, data.month, data.day, data.hour, data.minute, tz)
-        c     = _compute_chart(jd, data.lat, data.lng)
+        c     = _compute_chart(jd, data.lat, data.lng, data.include_outer_planets)
         birth_dt = datetime(data.year, data.month, data.day, data.hour, data.minute)
         return {
             "name":    data.name,
